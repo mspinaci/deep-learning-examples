@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import os, cv2
+from sklearn.svm import LinearSVC
 
 try:
     from IPython.display import display
@@ -149,12 +150,39 @@ class Sequential:
 
     def initialize_layer_by_SVM(self, l, batch_size=256):
         input_shape = self.layers[0].input_shape
-        input, labels = self.load_random_input(batch_size, input_shape[1:])
+
+        svms = []
+        for f in range(l.filters):
+            
+            pics, labels = self.load_random_input(batch_size, input_shape[1:], normalize=True)
+            if len(set(labels)) != 2:
+                raise NameError('For the moment, only 2 classes case is implemented...')
+
+            # For the moment, only do the version "without memory saving"
+
+            # Predict up to l (excluding) and take all the submatrices.
+            sm = l.extract_submatrices(self.predict(pics, until_layer=l))
+            reshaped = sm.reshape(-1, sm.shape[2])
+
+            # If it is not the first filter, give weight < 1 if a previous SVM already
+            # classifies it more or less correctly.
+            svm_labels = np.repeat(labels, sm.shape[1])
+            svm_labels[svm_labels == 0] = -1
+            sample_weights = np.ones(reshaped.shape[0])
+            for i in range(len(svms)):
+                # The following two alternatives give roughly the same result...
+                # sample_weights = np.minimum(sample_weights, 1-np.maximum(svms[i].decision_function(reshaped) * svm_labels, 0))
+                sample_weights = sample_weights * (1-np.maximum(svms[i].decision_function(reshaped) * svm_labels, 0))
+
+            print('Round {} of {}: {:.1f}% of the weights used'.format(f, l.filters, np.mean(sample_weights)*100))
+                
+            svms.append(LinearSVC())
+            # Fit the (Linear) support vector machine on all the submatrices; so we need to repeat the label quite a bit.
+            svms[-1].fit(reshaped, np.repeat(labels, sm.shape[1]), sample_weight = sample_weights)
+            
 
 
-
-
-    def load_random_input(self, batch_size, input_shape):
+    def load_random_input(self, batch_size, input_shape, normalize = True):
         ''' Loads a random sample of files and assigns them to classes using the subfolder
             names, like Keras does. '''
         folders = [f for f in os.listdir(self.folder) if os.path.isdir(os.path.join(self.folder, f))]
@@ -167,9 +195,9 @@ class Sequential:
 
         # Select some random elements per subfolder, as many as "quantities"
         # Only replace if batch_size is too big
-        files = [os.path.join(self.folder, subfol, f) for i,subfol in enumerate(folders) for f in np.random.choice(os.listdir(os.path.join(self.folders, subfol)),
+        files = [os.path.join(self.folder, subfol, f) for i,subfol in enumerate(folders) for f in np.random.choice(os.listdir(os.path.join(self.folder, subfol)),
                                                                                                                    quantities[i],
-                                                                                                                   quantities[i] > len(os.listdir(os.path.join(self.folders, subfol))))]
+                                                                                                                   quantities[i] > len(os.listdir(os.path.join(self.folder, subfol))))]
 
         pics = np.zeros((batch_size, *input_shape), dtype=np.uint8)
 
@@ -181,7 +209,16 @@ class Sequential:
         # Transform from BGR to RGB if in color
         for i, f in enumerate(np.array(files)[order]):
             pics[i] = cv2.resize(cv2.imread(os.path.join(self.folder, f), color)[:,:,::-1], input_shape[:2])
-        
-        # TODO: check the above, in particular that names and labels map correctly.
+
+        # Optionally subtract the mean and divide by the std along the first two dimensions
+        # (that are the batch dimension and spatial dimension, don't mix different filters/channels though).
+        # It should probably be replaced by a "global" normalization instead (with average
+        # and std throughout all the pixels of all the pictures), to avoid small batches
+        # effects - but that's probably the same in the end.
+        if normalize:
+            mean = pics.reshape(-1,pics.shape[-1]).mean(axis=0)
+            std = pics.reshape(-1,pics.shape[-1]).std(axis=0)
+            pics = (pics - mean) / std
+            
             
         return pics, labels
