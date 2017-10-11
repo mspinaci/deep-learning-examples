@@ -142,16 +142,21 @@ class Sequential:
         
 
     # From here on, experimental stuff on initializing by SVM
-    def initialize_by_SVM(self, folder):
+    def initialize_by_SVM(self, folder, batch_size=64):
         self.folder = folder
         for l in self.layers:
             if isinstance(l, Conv2D):
-                self.initialize_layer_by_SVM(l)
+                self.initialize_layer_by_SVM(l, batch_size=batch_size)
 
     def initialize_layer_by_SVM(self, l, batch_size=256):
         input_shape = self.layers[0].input_shape
 
         svms = []
+
+        raise NameError('Problema da risolvere: quando / cosa bisogna centrare e rinormalizzare? Ad ogni step? Perche'' ReLU e` abbastanza selvaggio, tutto e` positivo...')
+
+        l.weights = (np.zeros((l.kernel_size**2 * l.input_shape[3], l.filters)), np.zeros(l.filters))
+        
         for f in range(l.filters):
             
             pics, labels = self.load_random_input(batch_size, input_shape[1:], normalize=True)
@@ -170,15 +175,22 @@ class Sequential:
             svm_labels[svm_labels == 0] = -1
             sample_weights = np.ones(reshaped.shape[0])
             for i in range(len(svms)):
-                # The following two alternatives give roughly the same result...
-                # sample_weights = np.minimum(sample_weights, 1-np.maximum(svms[i].decision_function(reshaped) * svm_labels, 0))
-                sample_weights = sample_weights * (1-np.maximum(svms[i].decision_function(reshaped) * svm_labels, 0))
+                # The following two alternatives give roughly the same result... but hopefully the first one is more stable
+                sample_weights = np.minimum(sample_weights, 1-np.maximum(svms[i].decision_function(reshaped) * svm_labels, 0))
+                # sample_weights = sample_weights * (1-np.maximum(svms[i].decision_function(reshaped) * svm_labels, 0))
 
             print('Round {} of {}: {:.1f}% of the weights used'.format(f, l.filters, np.mean(sample_weights)*100))
                 
             svms.append(LinearSVC())
             # Fit the (Linear) support vector machine on all the submatrices; so we need to repeat the label quite a bit.
             svms[-1].fit(reshaped, np.repeat(labels, sm.shape[1]), sample_weight = sample_weights)
+
+            # As the CNN weights go, there is no difference between f(x) and -f(x)...
+            # So let's force positive bias, to avoid dead neurons.
+            sign = np.sign(svms[-1].intercept_)
+            norm = np.sqrt(np.sum(svms[-1].coef_**2))
+            l.weights[0][:,f] = svms[-1].coef_.flatten() / norm * sign
+            l.weights[1][f] = svms[-1].intercept_ / norm * sign
             
 
 
