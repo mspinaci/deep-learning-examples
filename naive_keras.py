@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import os, cv2
+from time import time
 from sklearn.svm import LinearSVC
 
 try:
@@ -28,6 +29,41 @@ class Layer:
         bad = [i for i in range(1, len(x.shape)) if x.shape[i] != self.input_shape[i]]
         if len(bad) > 0:
             raise NameError('The {}-th dim of x is {}, should be {} (plus {} more dims)'.format(bad[0], x.shape[bad[0]], self.input_shape[bad[0]], len(bad)-1))
+
+class Dense(Layer):
+    def __init__(self, units, activation='relu', input_shape=None, output_shape=None):
+        self.units = units
+        self.activation = activation
+        
+        Layer.__init__(self, input_shape, output_shape)
+
+    def set_output_shape(self, input_shape=None):
+        if input_shape is None:
+            input_shape = self.input_shape
+
+        output_shape = (input_shape[0], self.units)
+        assert self.output_shape is None or self.output_shape == output_shape
+        self.output_shape = output_shape
+        # Initialize as normal vectors
+        self.weights = (np.random.randn(np.prod(input_shape[1:]), self.units) / np.sqrt(np.random.randn(np.prod(input_shape[1:]))),
+                        np.zeros(self.units))
+
+    def predict(self, x):
+        self.check_input_shape(x)
+
+        # Flatten all dimension of x (except sample)
+        x = x.reshape(x.shape[0], -1)
+        
+        output = x.dot(self.weights[0]) + self.weights[1].reshape(1,-1)
+
+        if self.activation == 'relu':
+            return np.maximum(output, 0)
+        elif self.activation is None:
+            return output
+        elif self.activation == 'softmax':
+            e_x = np.exp(output - np.max(output))
+            return e_x / np.sum(e_x)
+        
     
 
 class Conv2D(Layer):
@@ -145,57 +181,102 @@ class Sequential:
     def initialize_by_SVM(self, folder, batch_size=64):
         self.folder = folder
         for l in self.layers:
-            if isinstance(l, Conv2D):
-                svms = self.initialize_layer_by_SVM(l, batch_size=batch_size)
-        return svms
+            # Fit quickly on small batches for convolution layers or dense layers - except the last one.
+            if isinstance(l, Conv2D) or (isinstance(l, Dense) and [l1 for l1 in self.layers if isinstance(l1, Dense)][::-1].index(l) == 0)
+                last_svms = self.initialize_layer_by_SVM(l, batch_size=batch_size)
+            elif isinstance(l, Dense):
+                # Last dense layer, do a proper fit, with random load, shuffling, etc.
+                self.fit_Dense_layer(l, epochs=1)
 
-    def initialize_layer_by_SVM(self, l, batch_size=256):
+        # Returns only the last svms for debugging purposes.
+        return last_svms
+
+    def initialize_layer_by_SVM(self, l, batch_size=64):
         input_shape = self.layers[0].input_shape
 
         svms = []
 
         l.weights = (np.zeros((l.kernel_size**2 * l.input_shape[3], l.filters)), np.zeros(l.filters))
+
+        time_in_load = 0
+        time_in_predict = 0
+        time_in_fit = 0
+        total_time = 0
         
         for f in range(l.filters):
-            
+
+            tstart = time()
             pics, labels = self.load_random_input(batch_size, input_shape[1:], normalize=True, balanced=True)
+            time_in_load += time() - tstart
+            
             if len(set(labels)) != 2:
                 raise NameError('For the moment, only 2 classes case is implemented...')
 
             # For the moment, only do the version "without memory saving"
 
             # Predict up to l (excluding) and take all the submatrices.
-            sm = l.extract_submatrices(self.predict(pics, until_layer=l))
+            tstart = time()
+            pics = self.predict(pics, until_layer=l)
+            time_in_predict += time() - tstart
+            
             reshaped = sm.reshape(-1, sm.shape[2])
 
-            # If it is not the first filter, give weight < 1 if a previous SVM already
-            # classifies it more or less correctly.
-            svm_labels = np.repeat(labels, sm.shape[1])
-            svm_labels[svm_labels == 0] = -1
-            sample_weights = np.ones(reshaped.shape[0])
-            for i in range(len(svms)):
-                # The following two alternatives give roughly the same result... but hopefully the first one is more stable
-                sample_weights = np.maximum(np.minimum(sample_weights, 1-np.maximum(svms[i].decision_function(reshaped) * svm_labels, 0)), 0)
-                # sample_weights = sample_weights * (1-np.maximum(svms[i].decision_function(reshaped) * svm_labels, 0))
-
-            print('Round {} of {}: {:.1f}% of the weights used'.format(f, l.filters, np.mean(sample_weights)*100))
+            tstart = time()
+            if isinstance(l, Conv2D):
+                sm = l.extract_submatrices(pics)
+                svms = fit_and_append(svms, sm.reshape(-1, sm.shape[2]), np.repeat(labels, sm.shape[1]))
+            elif isinstance(l, Dense):
+                svms = fit_and_append(svms, pics.reshape(pics.shape[0], -1), labels)
+            time_in_fit += time()-tstart
+            
+            print('Round {} of {}: {:.1f}% of the weights was used'.format(f, l.filters, np.mean(sample_weights)*100))
                 
-            svms.append(LinearSVC(dual=False))
-            # Fit the (Linear) support vector machine on all the submatrices; so we need to repeat the label quite a bit.
-            svms[-1].fit(reshaped, np.repeat(labels, sm.shape[1]), sample_weight = sample_weights)
-
             # As the CNN weights go, there is no difference between f(x) and -f(x)...
             # So let's force positive bias, to avoid dead neurons.
 
             # Actually, now with balanced=True it's possibly redundant. To check whether it should
             # be removed...
-            raise NameError("To Check: whether forcing the intercept to be positive is still adequate.")
-            sign = np.sign(svms[-1].intercept_)
+            #            raise NameError("To Check: whether forcing the intercept to be positive is still adequate.")
+            #            sign = np.sign(svms[-1].intercept_)
+            sign = 1
             norm = np.sqrt(np.sum(svms[-1].coef_**2))
             l.weights[0][:,f] = svms[-1].coef_.flatten() / norm * sign
             l.weights[1][f] = svms[-1].intercept_ / norm * sign
-            
+
+        print('\nElapsed {:.3f}s. Of these, {:.3f}s to load pics, {:.3f}s to predict, {:.3f}s to fit.\n'.format(
+            time()-global_start, time_in_load, time_in_predict, time_in_fit))
+        
         return svms
+
+    def fit_and_append(svms, x, labels):
+        '''
+        svms is a vector of svm that we consider "already trained".
+        x has shape N x K, labels N, as usual in svm. Assume labels is only 0 or 1,
+        that we replace to -1 and 1 as in typical SVM.
+        '''
+        labels = labels*2-1
+        sample_weights = np.ones(x.shape[0])
+
+        # If it is not the first filter, give weight < 1 if a previous SVM already
+        # classifies it more or less correctly.
+        for s in svms:
+            sample_weights = np.maximum(np.minimum(sample_weights, 1-np.maximum(s.decision_function(x) * labels, 0)), 0)
+            # The following gives some numerical errors sometimes...
+            # sample_weights = sample_weights * (1-np.maximum(svms[i].decision_function(reshaped) * svm_labels, 0))
+
+        svms.append(LinearSVC(dual=False))
+        svms[-1].fit(x, labels, sample_weight = sample_weights)
+
+        return svms
+
+    def fit_layer_on_all_pics(self, l, epochs=1):
+        '''
+        Fits a Dense layer by testing it on all the samples, like a usual neural network.
+        On each epoch loads as many pics as there are in the folder, but shuffling, so
+        actually each pic might be loaded more than once (or never) per epoch.
+        '''
+        raise NameError('Still to implement fit_Dense_layer')
+            
 
     def load_random_input(self, batch_size, input_shape, normalize = True, balanced = False):
         ''' Loads a random sample of files and assigns them to classes using the subfolder
