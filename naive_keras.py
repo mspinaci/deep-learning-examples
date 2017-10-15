@@ -1,14 +1,35 @@
 import numpy as np
 import pandas as pd
-import os, cv2
+import os, cv2, errno
+import bcolz
 from time import time
+from tqdm import trange
 from sklearn.svm import LinearSVC
+from sklearn.linear_model import SGDClassifier
 
 try:
     from IPython.display import display
 except:
     display = print
 
+def create_dir(directory):
+    try:
+        os.makedirs(directory)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+
+def save_array(fname, arr):
+    c=bcolz.carray(arr, rootdir=fname, mode='w')
+    c.flush()
+
+
+def load_array(fname):
+    return bcolz.open(fname)[:]
+
+
+        
 class Layer:
     def __init__(self, input_shape=None, output_shape=None):
         self.input_shape = input_shape
@@ -48,13 +69,17 @@ class Dense(Layer):
         self.weights = (np.random.randn(np.prod(input_shape[1:]), self.units) / np.sqrt(np.random.randn(np.prod(input_shape[1:]))),
                         np.zeros(self.units))
 
-    def predict(self, x):
+    def predict(self, x, verbose=False):
         self.check_input_shape(x)
 
         # Flatten all dimension of x (except sample)
         x = x.reshape(x.shape[0], -1)
         
         output = x.dot(self.weights[0]) + self.weights[1].reshape(1,-1)
+
+        if verbose:
+            print(' ** To predict Dense layer, used about {:.3f}GB of RAM'.format(
+                8e-9 * max(x.size, output.size, self.weights[0].size + self.weights[1].size)))
 
         if self.activation == 'relu':
             return np.maximum(output, 0)
@@ -87,12 +112,20 @@ class Conv2D(Layer):
                         np.zeros(self.filters))
 
 
-    def predict(self, x):
+    def predict(self, x, verbose=False):
         self.check_input_shape(x)
         if not self.save_memory:
             # Simpler format, just use "extract_submatrices".
-            output = (self.extract_submatrices(x).dot(self.weights[0]) + \
+            sm = self.extract_submatrices(x)
+            output = (sm.dot(self.weights[0]) + \
                       self.weights[1].reshape(1,1,-1)).reshape(x.shape[0], *self.output_shape[1:])
+            
+            if verbose:
+                # The last one is the size of self.extract_submatrices(x), which should almost always win.
+                print(' ** To predict Dense layer, used about {:.3f}GB of RAM'.format(
+                    8e-9 * max(x.size, output.size, self.weights[0].size + self.weights[1].size, sm.size)))
+
+            del sm
         else:
             # With for loops, but does not create >9x memory overhead.
             output = np.zeros((x.shape[0], *self.output_shape[1:]))
@@ -100,7 +133,12 @@ class Conv2D(Layer):
                 for j in range(self.kernel_size):
                     output += x[:, i:i+self.output_shape[1], j:j+self.output_shape[2]].dot(self.weights[0].reshape(self.kernel_size, self.kernel_size, -1, self.filters)[i,j,:]) +\
                               self.weights[1].reshape(1,1,1,-1)
+            
+            if verbose:
+                print(' ** To predict Dense layer, used about {:.3f}GB of RAM'.format(
+                    8e-9 * max(x.size, output.size, self.weights[0].size + self.weights[1].size)))
 
+                
         if self.activation == 'relu':
             return np.maximum(output, 0)
         elif self.activation is None:
@@ -120,7 +158,7 @@ class ZeroPadding2D(Layer):
         assert self.output_shape is None or self.output_shape == output_shape
         self.output_shape = output_shape
 
-    def predict(self, x):
+    def predict(self, x, verbose=False):
         self.check_input_shape(x)
         output = np.zeros((x.shape[0], *self.output_shape[1:]))
         output[:,1:-1, 1:-1, :] = x
@@ -137,7 +175,7 @@ class MaxPooling2D(Layer):
         assert self.output_shape is None or self.output_shape == output_shape
         self.output_shape = output_shape
 
-    def predict(self, x):
+    def predict(self, x, verbose=False):
         self.check_input_shape(x)
         # At this point, the dimensions should be even already by the constructor...
         return np.maximum(np.maximum(x[:, ::2, ::2], x[:,1::2,::2]), np.maximum(x[:,::2,1::2], x[:,1::2,1::2]))
@@ -158,14 +196,14 @@ class Sequential:
                 assert self.layers[i].input_shape == self.layers[i-1].output_shape
             self.layers[i].set_output_shape()
 
-    def predict(self, x, up_to_layer = None, until_layer = None):
+    def predict(self, x, up_to_layer = None, until_layer = None, verbose=False):
         ''' Predicts all through the network. Unless one of the two silly additional
             parameters are set, in which case stops at the first between up_to_layer or
             the one before until_layer. '''
         for l in self.layers:
             if l == until_layer:
                 break
-            x = l.predict(x)
+            x = l.predict(x, verbose=verbose)
             if l == up_to_layer:
                 break
         return x
@@ -178,11 +216,12 @@ class Sequential:
         
 
     # From here on, experimental stuff on initializing by SVM
-    def initialize_by_SVM(self, folder, batch_size=64):
-        self.folder = folder
+    def initialize_by_SVM(self, train_folder, valid_folder=None, batch_size=64):
+        self.folder = train_folder
+        self.valid_folder = valid_folder
         for l in self.layers:
             # Fit quickly on small batches for convolution layers or dense layers - except the last one.
-            if isinstance(l, Conv2D) or (isinstance(l, Dense) and [l1 for l1 in self.layers if isinstance(l1, Dense)][::-1].index(l) == 0)
+            if isinstance(l, Conv2D) or (isinstance(l, Dense) and [l1 for l1 in self.layers if isinstance(l1, Dense)][::-1].index(l) == 0):
                 last_svms = self.initialize_layer_by_SVM(l, batch_size=batch_size)
             elif isinstance(l, Dense):
                 # Last dense layer, do a proper fit, with random load, shuffling, etc.
@@ -202,12 +241,17 @@ class Sequential:
         time_in_predict = 0
         time_in_fit = 0
         total_time = 0
+        max_size = 0
+        global_start = time()
+
+        tr = trange(l.filters)
         
-        for f in range(l.filters):
+        for f in tr:
 
             tstart = time()
             pics, labels = self.load_random_input(batch_size, input_shape[1:], normalize=True, balanced=True)
             time_in_load += time() - tstart
+            max_size = max(max_size, pics.size)
             
             if len(set(labels)) != 2:
                 raise NameError('For the moment, only 2 classes case is implemented...')
@@ -218,18 +262,19 @@ class Sequential:
             tstart = time()
             pics = self.predict(pics, until_layer=l)
             time_in_predict += time() - tstart
-            
-            reshaped = sm.reshape(-1, sm.shape[2])
+            max_size = max(max_size, pics.size)
 
             tstart = time()
             if isinstance(l, Conv2D):
                 sm = l.extract_submatrices(pics)
-                svms = fit_and_append(svms, sm.reshape(-1, sm.shape[2]), np.repeat(labels, sm.shape[1]))
+                max_size = max(max_size, sm.size+pics.size)
+                svms, sample_weights = self.fit_and_append(svms, sm.reshape(-1, sm.shape[2]), np.repeat(labels, sm.shape[1]))
             elif isinstance(l, Dense):
-                svms = fit_and_append(svms, pics.reshape(pics.shape[0], -1), labels)
+                svms, sample_weights = self.fit_and_append(svms, pics.reshape(pics.shape[0], -1), labels)
             time_in_fit += time()-tstart
             
-            print('Round {} of {}: {:.1f}% of the weights was used'.format(f, l.filters, np.mean(sample_weights)*100))
+            # print('Round {} of {}: {:.1f}% of the weights was used'.format(f, l.filters, np.mean(sample_weights)*100))
+            tr.set_postfix(used_weights='{:.1f}%'.format(np.mean(sample_weights)*100))
                 
             # As the CNN weights go, there is no difference between f(x) and -f(x)...
             # So let's force positive bias, to avoid dead neurons.
@@ -243,12 +288,13 @@ class Sequential:
             l.weights[0][:,f] = svms[-1].coef_.flatten() / norm * sign
             l.weights[1][f] = svms[-1].intercept_ / norm * sign
 
-        print('\nElapsed {:.3f}s. Of these, {:.3f}s to load pics, {:.3f}s to predict, {:.3f}s to fit.\n'.format(
+        print('\nElapsed {:.3f}s. Of these, {:.3f}s to load pics, {:.3f}s to predict, {:.3f}s to fit.'.format(
             time()-global_start, time_in_load, time_in_predict, time_in_fit))
+        print('Used around {:.3f}GB of RAM\n'.format(8e-9 * max_size))
         
         return svms
 
-    def fit_and_append(svms, x, labels):
+    def fit_and_append(self, svms, x, labels):
         '''
         svms is a vector of svm that we consider "already trained".
         x has shape N x K, labels N, as usual in svm. Assume labels is only 0 or 1,
@@ -267,18 +313,70 @@ class Sequential:
         svms.append(LinearSVC(dual=False))
         svms[-1].fit(x, labels, sample_weight = sample_weights)
 
-        return svms
+        return svms, sample_weights
 
-    def fit_layer_on_all_pics(self, l, epochs=1):
+    def fit_Dense_layer(self, l, epochs=1, temp_folder='/tmp/deeplearning', batch_size=64):
         '''
         Fits a Dense layer by testing it on all the samples, like a usual neural network.
         On each epoch loads as many pics as there are in the folder, but shuffling, so
         actually each pic might be loaded more than once (or never) per epoch.
         '''
-        raise NameError('Still to implement fit_Dense_layer')
+        train_folder = os.path.join(temp_folder, 'train')
+        valid_folder = os.path.join(temp_folder, 'valid')
+        
+        backup_train = self.folder
+        print('Predicting train folder')
+        number_of_train = self.predict_all_and_save(self.folder, train_folder)
+        print('Predicting valid folder')
+        number_of_valid = self.predict_all_and_save(self.valid_folder, valid_folder)
+
+        svm = SGDClassifier()
+        
+        for e in epochs:
+            print('Epoch {}. Starting to fit images to last layer'.format(e+1))
+            self.folder = train_folder
+            for _ in trange(number_of_train // batch_size):
+                pics, labels = self.load_random_input(batch_size, l.input_shape[1:], normalize=False, balanced=True)
+                
+                svm.partial_fit(pics, labels, classes=np.unique(labels))
+
+            folders = [f for f in os.listdir(valid_folder) if os.path.isdir(os.path.join(valid_folder, f))]
+            tr = trange(number_of_valid // batch_size)
+            self.folder = valid_folder
+            # Not ideal, load randomly validation too, but it's not worth to reimplement all...
+            score = 0
+            for i in tr:
+                pics, labels = self.load_random_input(batch_size, l.input_shape[1:], normalize=False, balanced=True)
+
+                score = (i*score + svm.score(pics, labels)) / (i+1)
+                tr.set_postfix(valid_score = '{:.1f}%'.format(100*score))
+
+        self.folder = backup_folder
+
+    def predict_all_and_save(self, input_folder, output_folder, until_layer=None):
+        ''' Predicts all the inputs (optionally until a given layer) and saves the result.
+            Returns the total number of train elements. '''
+        create_dir(output_folder)
+        folders = [f for f in os.listdir(input_folder) if os.path.isdir(os.path.join(input_folder, f))]
+
+        color = int(self.layers[0].input_shape[-1] > 1)
+
+        total_number = 0
+
+        for subfol in folders:
+            print('Predicting and saving', subfol)
+            create_dir(os.path.join(output_folder, subfol))
+            files = [os.path.join(subfol, f) for f in os.listdir(os.path.join(input_folder, subfol))]
+            total_number += len(files)
+            for f in tqdm(files):
+                pic = cv2.resize(cv2.imread(os.path.join(input_folder, subfol, f), color)[:,:,::-1], self.layers[0].input_shape[1:3])
+                out = self.predict(np.expand_dims(pic, 0), until_layer=until_layer)
+                save_array(os.path.join(output_folder, subfol, ''.join((f, '.bz'))), out)
+
+        return total_number
             
 
-    def load_random_input(self, batch_size, input_shape, normalize = True, balanced = False):
+    def load_random_input(self, batch_size, input_shape, normalize = True, balanced = True):
         ''' Loads a random sample of files and assigns them to classes using the subfolder
             names, like Keras does. '''
         folders = [f for f in os.listdir(self.folder) if os.path.isdir(os.path.join(self.folder, f))]
@@ -309,7 +407,10 @@ class Sequential:
         
         # Transform from BGR to RGB if in color
         for i, f in enumerate(np.array(files)[order]):
-            pics[i] = cv2.resize(cv2.imread(os.path.join(self.folder, f), color)[:,:,::-1], input_shape[:2])
+            if f.lower().endswith('.jpg') or f.lower().endswith('.jpeg') or f.lower().endswith('.png'):
+                pics[i] = cv2.resize(cv2.imread(os.path.join(self.folder, f), color)[:,:,::-1], input_shape[:2])
+            elif f.lower().endswith('.bz'):
+                pics[i] = load_array(os.path.join(self.folder, f))
 
         # Optionally subtract the mean and divide by the std along the first two dimensions
         # (that are the batch dimension and spatial dimension, don't mix different filters/channels though).
