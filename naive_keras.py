@@ -3,7 +3,7 @@ import pandas as pd
 import os, cv2, errno
 import bcolz
 from time import time
-from tqdm import trange
+from tqdm import trange, tqdm
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import SGDClassifier
 
@@ -66,7 +66,7 @@ class Dense(Layer):
         assert self.output_shape is None or self.output_shape == output_shape
         self.output_shape = output_shape
         # Initialize as normal vectors
-        self.weights = (np.random.randn(np.prod(input_shape[1:]), self.units) / np.sqrt(np.random.randn(np.prod(input_shape[1:]))),
+        self.weights = (np.random.randn(np.prod(input_shape[1:]), self.units) / np.sqrt(np.prod(input_shape[1:])),
                         np.zeros(self.units))
 
     def predict(self, x, verbose=False):
@@ -216,16 +216,16 @@ class Sequential:
         
 
     # From here on, experimental stuff on initializing by SVM
-    def initialize_by_SVM(self, train_folder, valid_folder=None, batch_size=64):
+    def initialize_by_SVM(self, train_folder, valid_folder=None, batch_size=64, recompute=True, final_epochs=1):
         self.folder = train_folder
         self.valid_folder = valid_folder
         for l in self.layers:
             # Fit quickly on small batches for convolution layers or dense layers - except the last one.
-            if isinstance(l, Conv2D) or (isinstance(l, Dense) and [l1 for l1 in self.layers if isinstance(l1, Dense)][::-1].index(l) == 0):
+            if isinstance(l, Conv2D) or (isinstance(l, Dense) and [l1 for l1 in self.layers if isinstance(l1, Dense)][::-1].index(l) != 0):
                 last_svms = self.initialize_layer_by_SVM(l, batch_size=batch_size)
             elif isinstance(l, Dense):
                 # Last dense layer, do a proper fit, with random load, shuffling, etc.
-                self.fit_Dense_layer(l, epochs=1)
+                last_svms = self.fit_Dense_layer(l, epochs=final_epochs, recompute=recompute)
 
         # Returns only the last svms for debugging purposes.
         return last_svms
@@ -235,7 +235,12 @@ class Sequential:
 
         svms = []
 
-        l.weights = (np.zeros((l.kernel_size**2 * l.input_shape[3], l.filters)), np.zeros(l.filters))
+        if isinstance(l, Conv2D):
+            l.weights = (np.zeros((l.kernel_size**2 * l.input_shape[3], l.filters)), np.zeros(l.filters))
+            filters = l.filters
+        else:
+            l.weights = (np.zeros((np.prod(l.input_shape[1:]), l.units)), np.zeros(l.units))
+            filters = l.units
 
         time_in_load = 0
         time_in_predict = 0
@@ -244,7 +249,7 @@ class Sequential:
         max_size = 0
         global_start = time()
 
-        tr = trange(l.filters)
+        tr = trange(filters)
         
         for f in tr:
 
@@ -315,7 +320,7 @@ class Sequential:
 
         return svms, sample_weights
 
-    def fit_Dense_layer(self, l, epochs=1, temp_folder='/tmp/deeplearning', batch_size=64):
+    def fit_Dense_layer(self, l, epochs=1, temp_folder='/tmp/deeplearning', batch_size=64, recompute=True):
         '''
         Fits a Dense layer by testing it on all the samples, like a usual neural network.
         On each epoch loads as many pics as there are in the folder, but shuffling, so
@@ -326,19 +331,24 @@ class Sequential:
         
         backup_train = self.folder
         print('Predicting train folder')
-        number_of_train = self.predict_all_and_save(self.folder, train_folder)
+        number_of_train = self.predict_all_and_save(self.folder, train_folder, until_layer=l, recompute=recompute)
         print('Predicting valid folder')
-        number_of_valid = self.predict_all_and_save(self.valid_folder, valid_folder)
+        number_of_valid = self.predict_all_and_save(self.valid_folder, valid_folder, until_layer=l, recompute=recompute)
 
-        svm = SGDClassifier()
+        svm = SGDClassifier(max_iter=1000)
         
-        for e in epochs:
+        for e in range(epochs):
             print('Epoch {}. Starting to fit images to last layer'.format(e+1))
             self.folder = train_folder
-            for _ in trange(number_of_train // batch_size):
+            tr = trange(number_of_train // batch_size)
+            score = 0
+            for i in tr:
                 pics, labels = self.load_random_input(batch_size, l.input_shape[1:], normalize=False, balanced=True)
                 
-                svm.partial_fit(pics, labels, classes=np.unique(labels))
+                svm.partial_fit(pics.reshape(pics.shape[0], -1), labels, classes=np.unique(labels))
+
+                score = (i*score + svm.score(pics.reshape(pics.shape[0], -1), labels)) / (i+1)
+                tr.set_postfix(train_score = '{:.1f}%'.format(100*score))
 
             folders = [f for f in os.listdir(valid_folder) if os.path.isdir(os.path.join(valid_folder, f))]
             tr = trange(number_of_valid // batch_size)
@@ -348,12 +358,15 @@ class Sequential:
             for i in tr:
                 pics, labels = self.load_random_input(batch_size, l.input_shape[1:], normalize=False, balanced=True)
 
-                score = (i*score + svm.score(pics, labels)) / (i+1)
+                score = (i*score + svm.score(pics.reshape(pics.shape[0], -1), labels)) / (i+1)
                 tr.set_postfix(valid_score = '{:.1f}%'.format(100*score))
+            print('Validation score: {:.1f}%'.format(100*score))
 
-        self.folder = backup_folder
+        self.folder = backup_train
 
-    def predict_all_and_save(self, input_folder, output_folder, until_layer=None):
+        return [svm]
+
+    def predict_all_and_save(self, input_folder, output_folder, until_layer=None, recompute=True):
         ''' Predicts all the inputs (optionally until a given layer) and saves the result.
             Returns the total number of train elements. '''
         create_dir(output_folder)
@@ -364,14 +377,15 @@ class Sequential:
         total_number = 0
 
         for subfol in folders:
-            print('Predicting and saving', subfol)
             create_dir(os.path.join(output_folder, subfol))
             files = [os.path.join(subfol, f) for f in os.listdir(os.path.join(input_folder, subfol))]
             total_number += len(files)
-            for f in tqdm(files):
-                pic = cv2.resize(cv2.imread(os.path.join(input_folder, subfol, f), color)[:,:,::-1], self.layers[0].input_shape[1:3])
-                out = self.predict(np.expand_dims(pic, 0), until_layer=until_layer)
-                save_array(os.path.join(output_folder, subfol, ''.join((f, '.bz'))), out)
+            if recompute:
+                print('Predicting and saving', subfol)
+                for f in tqdm(files):
+                    pic = cv2.resize(cv2.imread(os.path.join(input_folder, f), color)[:,:,::-1], self.layers[0].input_shape[1:3])
+                    out = self.predict(np.expand_dims(pic, 0), until_layer=until_layer)
+                    save_array(os.path.join(output_folder, ''.join((f, '.bz'))), out)
 
         return total_number
             
@@ -382,7 +396,7 @@ class Sequential:
         folders = [f for f in os.listdir(self.folder) if os.path.isdir(os.path.join(self.folder, f))]
 
         assert len(folders) > 1, 'There are {} folder(s) in {}, how could we do any classification?'.format(len(folders), self.folder)
-        assert input_shape[2] in [1, 3], 'Image should either be gray scale (last dim = 1) or BGR (last dim = 3), not {}'.format(input_shape[-1])
+        #assert input_shape[2] in [1, 3], 'Image should either be gray scale (last dim = 1) or BGR (last dim = 3), not {}'.format(input_shape[-1])
 
         # Select random quantities that total to batch_size
         if balanced:
@@ -400,15 +414,14 @@ class Sequential:
 
         pics = np.zeros((batch_size, *input_shape), dtype=np.uint8)
 
-        color = int(input_shape[2] > 1)
-
         order = np.random.permutation(list(range(len(files))))
         labels = np.repeat(list(range(len(folders))), quantities)[order]
         
         # Transform from BGR to RGB if in color
+        # color = int(input_shape[2] > 1)
         for i, f in enumerate(np.array(files)[order]):
             if f.lower().endswith('.jpg') or f.lower().endswith('.jpeg') or f.lower().endswith('.png'):
-                pics[i] = cv2.resize(cv2.imread(os.path.join(self.folder, f), color)[:,:,::-1], input_shape[:2])
+                pics[i] = cv2.resize(cv2.imread(os.path.join(self.folder, f), int(input_shape[2] > 1))[:,:,::-1], input_shape[:2])
             elif f.lower().endswith('.bz'):
                 pics[i] = load_array(os.path.join(self.folder, f))
 
