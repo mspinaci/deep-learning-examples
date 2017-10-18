@@ -229,6 +229,18 @@ class Sequential:
 
         # Returns only the last svms for debugging purposes.
         return last_svms
+    
+    def fit_only_last(self, train_folder, valid_folder=None, epochs=1, recompute=True):
+        self.folder = train_folder
+        self.valid_folder = valid_folder
+        for l in self.layers:
+            if isinstance(l, Dense) and [l1 for l1 in self.layers if isinstance(l1, Dense)][::-1].index(l) == 0:
+                # Last dense layer, do a proper fit, with random load, shuffling, etc.
+                last_svms = self.fit_Dense_layer(l, epochs=epochs, recompute=recompute)
+            
+        # Returns only the last svms for debugging purposes.
+        return last_svms
+
 
     def initialize_layer_by_SVM(self, l, batch_size=64):
         input_shape = self.layers[0].input_shape
@@ -437,3 +449,34 @@ class Sequential:
             
             
         return pics, labels
+
+    def load_weights(self, path):
+        i = 0
+        for l in self.layers:
+            try:
+                l.weights;
+            except:
+                pass
+            else:
+                weights = []
+                for j in range(len(l.weights)):
+                    weights.append(load_array(os.path.join(path, '{}_{}.bz'.format(i,j))))
+                    
+                
+                l.weights = tuple(weights)
+                i += 1
+
+
+    def save_weights(self, path):
+        i = 0
+        create_dir(path)
+        for l in self.layers:
+            # Only work with layers that have weights...
+            try:
+                l.weights;
+            except:
+                pass
+            else:
+                for j in range(len(l.weights)):
+                    save_array(os.path.join(path, '{}_{}.bz'.format(i,j)), l.weights[j])
+                    i += 1
